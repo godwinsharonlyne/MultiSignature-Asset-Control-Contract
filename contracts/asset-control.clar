@@ -194,3 +194,55 @@
     (ok true)
   )
 )
+
+
+
+(define-constant ERR_NOT_PROPOSAL_CREATOR (err u111))
+(define-constant ERR_PROPOSAL_CANCELLED (err u112))
+
+(define-map cancelled-proposals
+  { proposal-id: uint }
+  { cancelled: bool }
+)
+
+(define-read-only (is-proposal-cancelled (proposal-id uint))
+  (default-to false (get cancelled (map-get? cancelled-proposals { proposal-id: proposal-id })))
+)
+
+(define-public (cancel-proposal (proposal-id uint))
+  (let (
+    (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get creator proposal)) ERR_NOT_PROPOSAL_CREATOR)
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_ALREADY_EXECUTED)
+    (asserts! (not (is-proposal-cancelled proposal-id)) ERR_PROPOSAL_CANCELLED)
+    
+    (map-set cancelled-proposals
+      { proposal-id: proposal-id }
+      { cancelled: true }
+    )
+    (ok true)
+  )
+)
+
+
+
+(define-map owner-proposals
+  { owner: principal }
+  { proposal-ids: (list 50 uint) }
+)
+
+(define-read-only (get-owner-proposals (owner principal))
+  (default-to { proposal-ids: (list) } (map-get? owner-proposals { owner: owner }))
+)
+
+(define-private (add-to-owner-history (owner principal) (proposal-id uint))
+  (let (
+    (current-history (get-owner-proposals owner))
+  )
+    (map-set owner-proposals
+      { owner: owner }
+      { proposal-ids: (unwrap-panic (as-max-len? (append (get proposal-ids current-history) proposal-id) u50)) }
+    )
+  )
+)

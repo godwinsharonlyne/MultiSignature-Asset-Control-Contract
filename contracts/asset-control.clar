@@ -246,3 +246,221 @@
     )
   )
 )
+
+
+(define-constant ERR_CONTRACT_PAUSED (err u113))
+(define-constant ERR_CONTRACT_NOT_PAUSED (err u114))
+(define-constant ERR_PAUSE_PROPOSAL_EXISTS (err u115))
+
+(define-data-var contract-paused bool false)
+(define-data-var pause-proposal-id (optional uint) none)
+(define-data-var pause-proposal-expiration uint u0)
+
+(define-read-only (is-contract-paused)
+  (var-get contract-paused)
+)
+
+(define-read-only (get-pause-proposal-info)
+  {
+    proposal-id: (var-get pause-proposal-id),
+    expiration: (var-get pause-proposal-expiration)
+  }
+)
+
+(define-public (create-pause-proposal (expiration uint))
+  (begin
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (is-none (var-get pause-proposal-id)) ERR_PAUSE_PROPOSAL_EXISTS)
+    (asserts! (>= expiration stacks-block-height) ERR_PROPOSAL_EXPIRED)
+    
+    (let ((proposal-id (var-get proposal-nonce)))
+      (var-set pause-proposal-id (some proposal-id))
+      (var-set pause-proposal-expiration expiration)
+      (var-set proposal-nonce (+ proposal-id u1))
+      
+      (map-set proposal-signature-count
+        { proposal-id: proposal-id }
+        { count: u0 }
+      )
+      
+      (ok proposal-id)
+    )
+  )
+)
+
+(define-public (sign-pause-proposal)
+  (let (
+    (proposal-id (unwrap! (var-get pause-proposal-id) ERR_PROPOSAL_NOT_FOUND))
+    (signature-count (get-proposal-signature-count proposal-id))
+  )
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (has-signed proposal-id tx-sender)) ERR_ALREADY_SIGNED)
+    (asserts! (>= (var-get pause-proposal-expiration) stacks-block-height) ERR_PROPOSAL_EXPIRED)
+    
+    (map-set signatures
+      { proposal-id: proposal-id, signer: tx-sender }
+      { signed: true }
+    )
+    
+    (map-set proposal-signature-count
+      { proposal-id: proposal-id }
+      { count: (+ (get count signature-count) u1) }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (execute-pause)
+  (let (
+    (proposal-id (unwrap! (var-get pause-proposal-id) ERR_PROPOSAL_NOT_FOUND))
+    (signature-count (get-proposal-signature-count proposal-id))
+  )
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (>= (var-get pause-proposal-expiration) stacks-block-height) ERR_PROPOSAL_EXPIRED)
+    (asserts! (>= (get count signature-count) (var-get signature-threshold)) ERR_NOT_ENOUGH_SIGNATURES)
+    
+    (var-set contract-paused true)
+    (var-set pause-proposal-id none)
+    (var-set pause-proposal-expiration u0)
+    
+    (ok true)
+  )
+)
+
+(define-public (create-unpause-proposal (expiration uint))
+  (begin
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (var-get contract-paused) ERR_CONTRACT_NOT_PAUSED)
+    (asserts! (is-none (var-get pause-proposal-id)) ERR_PAUSE_PROPOSAL_EXISTS)
+    (asserts! (>= expiration stacks-block-height) ERR_PROPOSAL_EXPIRED)
+    
+    (let ((proposal-id (var-get proposal-nonce)))
+      (var-set pause-proposal-id (some proposal-id))
+      (var-set pause-proposal-expiration expiration)
+      (var-set proposal-nonce (+ proposal-id u1))
+      
+      (map-set proposal-signature-count
+        { proposal-id: proposal-id }
+        { count: u0 }
+      )
+      
+      (ok proposal-id)
+    )
+  )
+)
+
+(define-public (sign-unpause-proposal)
+  (let (
+    (proposal-id (unwrap! (var-get pause-proposal-id) ERR_PROPOSAL_NOT_FOUND))
+    (signature-count (get-proposal-signature-count proposal-id))
+  )
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (var-get contract-paused) ERR_CONTRACT_NOT_PAUSED)
+    (asserts! (not (has-signed proposal-id tx-sender)) ERR_ALREADY_SIGNED)
+    (asserts! (>= (var-get pause-proposal-expiration) stacks-block-height) ERR_PROPOSAL_EXPIRED)
+    
+    (map-set signatures
+      { proposal-id: proposal-id, signer: tx-sender }
+      { signed: true }
+    )
+    
+    (map-set proposal-signature-count
+      { proposal-id: proposal-id }
+      { count: (+ (get count signature-count) u1) }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (execute-unpause)
+  (let (
+    (proposal-id (unwrap! (var-get pause-proposal-id) ERR_PROPOSAL_NOT_FOUND))
+    (signature-count (get-proposal-signature-count proposal-id))
+  )
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (var-get contract-paused) ERR_CONTRACT_NOT_PAUSED)
+    (asserts! (>= (var-get pause-proposal-expiration) stacks-block-height) ERR_PROPOSAL_EXPIRED)
+    (asserts! (>= (get count signature-count) (var-get signature-threshold)) ERR_NOT_ENOUGH_SIGNATURES)
+    
+    (var-set contract-paused false)
+    (var-set pause-proposal-id none)
+    (var-set pause-proposal-expiration u0)
+    
+    (ok true)
+  )
+)
+
+(define-public (create-proposals (receiver principal) (amount uint) (description (string-ascii 256)) (expiration uint))
+  (let ((proposal-id (var-get proposal-nonce)))
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (>= expiration stacks-block-height) ERR_PROPOSAL_EXPIRED)
+    (map-set proposals
+      { proposal-id: proposal-id }
+      {
+        creator: tx-sender,
+        receiver: receiver,
+        amount: amount,
+        description: description,
+        expiration: expiration,
+        executed: false
+      }
+    )
+    (map-set proposal-signature-count
+      { proposal-id: proposal-id }
+      { count: u0 }
+    )
+    (var-set proposal-nonce (+ proposal-id u1))
+    (ok proposal-id)
+  )
+)
+
+(define-public (sign-proposals (proposal-id uint))
+  (let (
+    (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+    (signature-count (get-proposal-signature-count proposal-id))
+  )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (not (has-signed proposal-id tx-sender)) ERR_ALREADY_SIGNED)
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_ALREADY_EXECUTED)
+    (asserts! (>= (get expiration proposal) stacks-block-height) ERR_PROPOSAL_EXPIRED)
+    
+    (map-set signatures
+      { proposal-id: proposal-id, signer: tx-sender }
+      { signed: true }
+    )
+    
+    (map-set proposal-signature-count
+      { proposal-id: proposal-id }
+      { count: (+ (get count signature-count) u1) }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (execute-proposals (proposal-id uint))
+  (let (
+    (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+    (signature-count (get-proposal-signature-count proposal-id))
+  )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_ALREADY_EXECUTED)
+    (asserts! (>= (get expiration proposal) stacks-block-height) ERR_PROPOSAL_EXPIRED)
+    (asserts! (>= (get count signature-count) (var-get signature-threshold)) ERR_NOT_ENOUGH_SIGNATURES)
+    
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal { executed: true })
+    )
+    
+    (as-contract (stx-transfer? (get amount proposal) tx-sender (get receiver proposal)))
+  )
+)

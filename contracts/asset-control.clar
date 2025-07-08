@@ -14,9 +14,15 @@
 (define-constant ERR_OWNER_ALREADY_EXISTS (err u108))
 (define-constant ERR_OWNER_NOT_FOUND (err u109))
 (define-constant ERR_CANNOT_REMOVE_LAST_OWNER (err u110))
+(define-constant ERR_BATCH_SIZE_EXCEEDED (err u116))
+(define-constant ERR_BATCH_EMPTY (err u117))
+(define-constant ERR_TIMELOCK_NOT_READY (err u118))
+(define-constant ERR_PROPOSAL_NOT_QUEUED (err u119))
+(define-constant ERR_TIMELOCK_DELAY_TOO_SHORT (err u120))
 
 (define-data-var proposal-nonce uint u0)
 (define-data-var signature-threshold uint u2)
+(define-data-var timelock-delay uint u144)
 
 (define-map owners principal bool)
 (define-map proposals
@@ -41,6 +47,11 @@
   { count: uint }
 )
 
+(define-map queued-proposals
+  { proposal-id: uint }
+  { queued-at: uint, ready-at: uint }
+)
+
 (define-read-only (get-signature-threshold)
   (var-get signature-threshold)
 )
@@ -63,6 +74,21 @@
 
 (define-read-only (get-proposal-nonce)
   (var-get proposal-nonce)
+)
+
+(define-read-only (get-timelock-delay)
+  (var-get timelock-delay)
+)
+
+(define-read-only (get-queued-proposal (proposal-id uint))
+  (map-get? queued-proposals { proposal-id: proposal-id })
+)
+
+(define-read-only (is-proposal-ready (proposal-id uint))
+  (match (get-queued-proposal proposal-id)
+    queue-info (>= stacks-block-height (get ready-at queue-info))
+    false
+  )
 )
 
 (define-public (add-owner (new-owner principal))
@@ -462,5 +488,127 @@
     )
     
     (as-contract (stx-transfer? (get amount proposal) tx-sender (get receiver proposal)))
+  )
+)
+
+
+
+(define-private (validate-batch-proposal (proposal-id uint))
+  (let (
+    (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+    (signature-count (get-proposal-signature-count proposal-id))
+  )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_ALREADY_EXECUTED)
+    (asserts! (not (is-proposal-cancelled proposal-id)) ERR_PROPOSAL_CANCELLED)
+    (asserts! (>= (get expiration proposal) stacks-block-height) ERR_PROPOSAL_EXPIRED)
+    (asserts! (>= (get count signature-count) (var-get signature-threshold)) ERR_NOT_ENOUGH_SIGNATURES)
+    (ok proposal)
+  )
+)
+
+(define-private (execute-single-proposal (proposal-id uint))
+  (let (
+    (proposal (unwrap-panic (get-proposal proposal-id)))
+  )
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal { executed: true })
+    )
+    (unwrap-panic (as-contract (stx-transfer? (get amount proposal) tx-sender (get receiver proposal))))
+  )
+)
+
+(define-private (process-batch-proposal (proposal-id uint) (acc (response bool uint)))
+  (match acc
+    success (match (validate-batch-proposal proposal-id)
+              valid-proposal (begin
+                              (execute-single-proposal proposal-id)
+                              (ok true))
+              error-response (err error-response))
+    error-response (err error-response)
+  )
+)
+
+(define-public (execute-batch-proposals (proposal-ids (list 10 uint)))
+  (begin
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (> (len proposal-ids) u0) ERR_BATCH_EMPTY)
+    (asserts! (<= (len proposal-ids) u10) ERR_BATCH_SIZE_EXCEEDED)
+    
+    (fold process-batch-proposal proposal-ids (ok true))
+  )
+)
+
+(define-public (set-timelock-delay (new-delay uint))
+  (begin
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (>= new-delay u1) ERR_TIMELOCK_DELAY_TOO_SHORT)
+    (var-set timelock-delay new-delay)
+    (ok true)
+  )
+)
+
+(define-public (queue-proposal (proposal-id uint))
+  (let (
+    (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+    (signature-count (get-proposal-signature-count proposal-id))
+  )
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_ALREADY_EXECUTED)
+    (asserts! (not (is-proposal-cancelled proposal-id)) ERR_PROPOSAL_CANCELLED)
+    (asserts! (>= (get expiration proposal) stacks-block-height) ERR_PROPOSAL_EXPIRED)
+    (asserts! (>= (get count signature-count) (var-get signature-threshold)) ERR_NOT_ENOUGH_SIGNATURES)
+    
+    (let (
+      (current-block stacks-block-height)
+      (delay-blocks (var-get timelock-delay))
+    )
+      (map-set queued-proposals
+        { proposal-id: proposal-id }
+        { 
+          queued-at: current-block,
+          ready-at: (+ current-block delay-blocks)
+        }
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (execute-timelock-proposal (proposal-id uint))
+  (let (
+    (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+    (queue-info (unwrap! (get-queued-proposal proposal-id) ERR_PROPOSAL_NOT_QUEUED))
+  )
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_ALREADY_EXECUTED)
+    (asserts! (not (is-proposal-cancelled proposal-id)) ERR_PROPOSAL_CANCELLED)
+    (asserts! (>= (get expiration proposal) stacks-block-height) ERR_PROPOSAL_EXPIRED)
+    (asserts! (>= stacks-block-height (get ready-at queue-info)) ERR_TIMELOCK_NOT_READY)
+    
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal { executed: true })
+    )
+    
+    (map-delete queued-proposals { proposal-id: proposal-id })
+    
+    (as-contract (stx-transfer? (get amount proposal) tx-sender (get receiver proposal)))
+  )
+)
+
+(define-public (cancel-queued-proposal (proposal-id uint))
+  (let (
+    (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get creator proposal)) ERR_NOT_PROPOSAL_CREATOR)
+    (asserts! (is-some (get-queued-proposal proposal-id)) ERR_PROPOSAL_NOT_QUEUED)
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_ALREADY_EXECUTED)
+    
+    (map-delete queued-proposals { proposal-id: proposal-id })
+    (ok true)
   )
 )

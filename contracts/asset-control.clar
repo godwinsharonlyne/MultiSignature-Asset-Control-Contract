@@ -19,10 +19,17 @@
 (define-constant ERR_TIMELOCK_NOT_READY (err u118))
 (define-constant ERR_PROPOSAL_NOT_QUEUED (err u119))
 (define-constant ERR_TIMELOCK_DELAY_TOO_SHORT (err u120))
+(define-constant ERR_SPENDING_LIMIT_EXCEEDED (err u121))
+(define-constant ERR_SPENDING_LIMITS_DISABLED (err u122))
+(define-constant ERR_INVALID_LIMIT_AMOUNT (err u123))
+(define-constant ERR_RESET_PERIOD_TOO_SHORT (err u124))
 
 (define-data-var proposal-nonce uint u0)
 (define-data-var signature-threshold uint u2)
 (define-data-var timelock-delay uint u144)
+(define-data-var spending-limits-enabled bool true)
+(define-data-var default-spending-limit uint u1000000)
+(define-data-var limit-reset-period uint u144)
 
 (define-map owners principal bool)
 (define-map proposals
@@ -50,6 +57,18 @@
 (define-map queued-proposals
   { proposal-id: uint }
   { queued-at: uint, ready-at: uint }
+)
+
+;; Individual spending limits per owner
+(define-map owner-spending-limits
+  { owner: principal }
+  { limit: uint, spent: uint, last-reset: uint }
+)
+
+;; Emergency spending limit overrides
+(define-map spending-limit-overrides
+  { owner: principal }
+  { override-enabled: bool, override-limit: uint, expires-at: uint }
 )
 
 (define-read-only (get-signature-threshold)
@@ -88,6 +107,61 @@
   (match (get-queued-proposal proposal-id)
     queue-info (>= stacks-block-height (get ready-at queue-info))
     false
+  )
+)
+
+;; Get spending limit configuration
+(define-read-only (get-spending-limits-enabled)
+  (var-get spending-limits-enabled)
+)
+
+(define-read-only (get-default-spending-limit)
+  (var-get default-spending-limit)
+)
+
+(define-read-only (get-limit-reset-period)
+  (var-get limit-reset-period)
+)
+
+;; Get owner spending limit info
+(define-read-only (get-owner-spending-limit (owner principal))
+  (default-to 
+    { limit: (var-get default-spending-limit), spent: u0, last-reset: stacks-block-height }
+    (map-get? owner-spending-limits { owner: owner })
+  )
+)
+
+;; Get spending limit override info
+(define-read-only (get-spending-limit-override (owner principal))
+  (map-get? spending-limit-overrides { owner: owner })
+)
+
+;; Check if owner can spend amount without full multisig
+(define-read-only (can-spend-without-multisig (owner principal) (amount uint))
+  (if (not (var-get spending-limits-enabled))
+    false
+    (let (
+      (limit-info (get-owner-spending-limit owner))
+      (override-info (get-spending-limit-override owner))
+      (current-block stacks-block-height)
+      (reset-period (var-get limit-reset-period))
+    )
+      ;; Check if spending limit needs reset
+      (let (
+        (needs-reset (>= (- current-block (get last-reset limit-info)) reset-period))
+        (current-spent (if needs-reset u0 (get spent limit-info)))
+        (effective-limit 
+          (match override-info
+            override (if (and (get override-enabled override) 
+                             (< current-block (get expires-at override)))
+                       (get override-limit override)
+                       (get limit limit-info))
+            (get limit limit-info)
+          ))
+      )
+        (<= (+ current-spent amount) effective-limit)
+      )
+    )
   )
 )
 
@@ -612,3 +686,147 @@
     (ok true)
   )
 )
+
+;; Configure spending limits system
+(define-public (toggle-spending-limits (enabled bool))
+  (begin
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (var-set spending-limits-enabled enabled)
+    (ok true)
+  )
+)
+
+;; Set default spending limit for new owners
+(define-public (set-default-spending-limit (new-limit uint))
+  (begin
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (> new-limit u0) ERR_INVALID_LIMIT_AMOUNT)
+    (var-set default-spending-limit new-limit)
+    (ok true)
+  )
+)
+
+;; Set reset period for spending limits
+(define-public (set-limit-reset-period (new-period uint))
+  (begin
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (>= new-period u1) ERR_RESET_PERIOD_TOO_SHORT)
+    (var-set limit-reset-period new-period)
+    (ok true)
+  )
+)
+
+;; Set individual owner spending limit
+(define-public (set-owner-spending-limit (owner principal) (new-limit uint))
+  (begin
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-owner owner) ERR_OWNER_NOT_FOUND)
+    (asserts! (> new-limit u0) ERR_INVALID_LIMIT_AMOUNT)
+    
+    (let (
+      (current-info (get-owner-spending-limit owner))
+      (current-block stacks-block-height)
+      (reset-period (var-get limit-reset-period))
+      (needs-reset (>= (- current-block (get last-reset current-info)) reset-period))
+    )
+      (map-set owner-spending-limits
+        { owner: owner }
+        {
+          limit: new-limit,
+          spent: (if needs-reset u0 (get spent current-info)),
+          last-reset: (if needs-reset current-block (get last-reset current-info))
+        }
+      )
+      (ok true)
+    )
+  )
+)
+
+;; Create emergency spending limit override
+(define-public (create-spending-override (owner principal) (override-limit uint) (duration-blocks uint))
+  (begin
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-owner owner) ERR_OWNER_NOT_FOUND)
+    (asserts! (> override-limit u0) ERR_INVALID_LIMIT_AMOUNT)
+    (asserts! (> duration-blocks u0) ERR_RESET_PERIOD_TOO_SHORT)
+    
+    (map-set spending-limit-overrides
+      { owner: owner }
+      {
+        override-enabled: true,
+        override-limit: override-limit,
+        expires-at: (+ stacks-block-height duration-blocks)
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Disable spending limit override
+(define-public (disable-spending-override (owner principal))
+  (begin
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-owner owner) ERR_OWNER_NOT_FOUND)
+    
+    (map-delete spending-limit-overrides { owner: owner })
+    (ok true)
+  )
+)
+
+;; Helper function to update spending tracking
+(define-private (update-spending-tracker (owner principal) (amount uint))
+  (let (
+    (current-info (get-owner-spending-limit owner))
+    (current-block stacks-block-height)
+    (reset-period (var-get limit-reset-period))
+    (needs-reset (>= (- current-block (get last-reset current-info)) reset-period))
+  )
+    (map-set owner-spending-limits
+      { owner: owner }
+      {
+        limit: (get limit current-info),
+        spent: (if needs-reset amount (+ (get spent current-info) amount)),
+        last-reset: (if needs-reset current-block (get last-reset current-info))
+      }
+    )
+  )
+)
+
+;; Execute small transaction bypassing full multisig
+(define-public (execute-small-transfer (receiver principal) (amount uint) (description (string-ascii 256)))
+  (begin
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (var-get spending-limits-enabled) ERR_SPENDING_LIMITS_DISABLED)
+    (asserts! (can-spend-without-multisig tx-sender amount) ERR_SPENDING_LIMIT_EXCEEDED)
+    
+    ;; Update spending tracker
+    (update-spending-tracker tx-sender amount)
+    
+    ;; Execute transfer
+    (as-contract (stx-transfer? amount tx-sender receiver))
+  )
+)
+
+;; Reset owner spending tracker manually (emergency use)
+(define-public (reset-owner-spending (owner principal))
+  (begin
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-owner owner) ERR_OWNER_NOT_FOUND)
+    
+    (let (
+      (current-info (get-owner-spending-limit owner))
+    )
+      (map-set owner-spending-limits
+        { owner: owner }
+        {
+          limit: (get limit current-info),
+          spent: u0,
+          last-reset: stacks-block-height
+        }
+      )
+      (ok true)
+    )
+  )
+)
+

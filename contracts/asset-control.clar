@@ -23,6 +23,11 @@
 (define-constant ERR_SPENDING_LIMITS_DISABLED (err u122))
 (define-constant ERR_INVALID_LIMIT_AMOUNT (err u123))
 (define-constant ERR_RESET_PERIOD_TOO_SHORT (err u124))
+(define-constant ERR_DELEGATION_NOT_FOUND (err u125))
+(define-constant ERR_DELEGATION_EXPIRED (err u126))
+(define-constant ERR_CANNOT_DELEGATE_TO_SELF (err u127))
+(define-constant ERR_DELEGATION_ALREADY_EXISTS (err u128))
+(define-constant ERR_DELEGATION_LIMIT_EXCEEDED (err u129))
 
 (define-data-var proposal-nonce uint u0)
 (define-data-var signature-threshold uint u2)
@@ -69,6 +74,24 @@
 (define-map spending-limit-overrides
   { owner: principal }
   { override-enabled: bool, override-limit: uint, expires-at: uint }
+)
+
+;; Delegation system - allows owners to delegate their signing authority
+(define-map delegations
+  { owner: principal, delegate: principal }
+  { active: bool, expires-at: uint, max-amount: uint, used-amount: uint }
+)
+
+;; Track active delegates for each owner
+(define-map owner-delegates
+  { owner: principal }
+  { delegate-list: (list 5 principal) }
+)
+
+;; Track active delegators for each delegate
+(define-map delegate-owners
+  { delegate: principal }
+  { owner-list: (list 10 principal) }
 )
 
 (define-read-only (get-signature-threshold)
@@ -684,6 +707,208 @@
     
     (map-delete queued-proposals { proposal-id: proposal-id })
     (ok true)
+  )
+)
+
+;; DELEGATION SYSTEM READ-ONLY FUNCTIONS
+
+;; Get delegation info between owner and delegate
+(define-read-only (get-delegation (owner principal) (delegate principal))
+  (map-get? delegations { owner: owner, delegate: delegate })
+)
+
+;; Get all delegates for an owner
+(define-read-only (get-owner-delegates (owner principal))
+  (default-to { delegate-list: (list) } (map-get? owner-delegates { owner: owner }))
+)
+
+;; Get all delegators for a delegate
+(define-read-only (get-delegate-owners (delegate principal))
+  (default-to { owner-list: (list) } (map-get? delegate-owners { delegate: delegate }))
+)
+
+;; Check if a delegation is active
+(define-read-only (is-delegation-active (owner principal) (delegate principal))
+  (match (get-delegation owner delegate)
+    delegation-info (and 
+                     (get active delegation-info)
+                     (>= (get expires-at delegation-info) stacks-block-height))
+    false
+  )
+)
+
+;; Check if delegate can sign for owner on a proposal amount
+(define-read-only (can-delegate-sign (owner principal) (delegate principal) (amount uint))
+  (match (get-delegation owner delegate)
+    delegation-info (and
+                     (get active delegation-info)
+                     (>= (get expires-at delegation-info) stacks-block-height)
+                     (<= (+ (get used-amount delegation-info) amount) (get max-amount delegation-info)))
+    false
+  )
+)
+
+;; Check if principal can sign (either as owner or valid delegate)
+(define-read-only (can-sign-proposal (signer principal) (proposal-id uint))
+  (let (
+    (proposal (unwrap! (get-proposal proposal-id) false))
+  )
+    (or 
+      ;; Direct owner check
+      (is-owner signer)
+      ;; For now, simple check - in practice would need custom iteration
+      false
+    )
+  )
+)
+
+;; DELEGATION MANAGEMENT FUNCTIONS
+
+;; Create a delegation from owner to delegate
+(define-public (create-delegation (delegate principal) (expires-at uint) (max-amount uint))
+  (begin
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (not (is-eq tx-sender delegate)) ERR_CANNOT_DELEGATE_TO_SELF)
+    (asserts! (>= expires-at stacks-block-height) ERR_DELEGATION_EXPIRED)
+    (asserts! (> max-amount u0) ERR_INVALID_LIMIT_AMOUNT)
+    (asserts! (is-none (get-delegation tx-sender delegate)) ERR_DELEGATION_ALREADY_EXISTS)
+    
+    ;; Create the delegation
+    (map-set delegations
+      { owner: tx-sender, delegate: delegate }
+      {
+        active: true,
+        expires-at: expires-at,
+        max-amount: max-amount,
+        used-amount: u0
+      }
+    )
+    
+    ;; Update owner delegates list
+    (let (
+      (current-delegates (get-owner-delegates tx-sender))
+    )
+      (map-set owner-delegates
+        { owner: tx-sender }
+        { delegate-list: (unwrap-panic (as-max-len? (append (get delegate-list current-delegates) delegate) u5)) }
+      )
+    )
+    
+    ;; Update delegate owners list
+    (let (
+      (current-owners (get-delegate-owners delegate))
+    )
+      (map-set delegate-owners
+        { delegate: delegate }
+        { owner-list: (unwrap-panic (as-max-len? (append (get owner-list current-owners) tx-sender) u10)) }
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Revoke a delegation
+(define-public (revoke-delegation (delegate principal))
+  (begin
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-some (get-delegation tx-sender delegate)) ERR_DELEGATION_NOT_FOUND)
+    
+    ;; Mark delegation as inactive
+    (let (
+      (delegation-info (unwrap-panic (get-delegation tx-sender delegate)))
+    )
+      (map-set delegations
+        { owner: tx-sender, delegate: delegate }
+        (merge delegation-info { active: false })
+      )
+    )
+    
+    ;; For simplicity, we'll clear the lists - could be improved with helper functions
+    (map-set owner-delegates
+      { owner: tx-sender }
+      { delegate-list: (list) }
+    )
+    
+    (map-set delegate-owners
+      { delegate: delegate }
+      { owner-list: (list) }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Update delegation amount limits
+(define-public (update-delegation-limit (delegate principal) (new-max-amount uint))
+  (begin
+    (asserts! (is-owner tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (> new-max-amount u0) ERR_INVALID_LIMIT_AMOUNT)
+    
+    (let (
+      (delegation-info (unwrap! (get-delegation tx-sender delegate) ERR_DELEGATION_NOT_FOUND))
+    )
+      (asserts! (get active delegation-info) ERR_DELEGATION_NOT_FOUND)
+      (asserts! (>= new-max-amount (get used-amount delegation-info)) ERR_DELEGATION_LIMIT_EXCEEDED)
+      
+      (map-set delegations
+        { owner: tx-sender, delegate: delegate }
+        (merge delegation-info { max-amount: new-max-amount })
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+;; Sign proposal as a delegate for an owner
+(define-public (sign-proposal-as-delegate (proposal-id uint) (owner principal))
+  (let (
+    (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+    (signature-count (get-proposal-signature-count proposal-id))
+    (delegation-info (unwrap! (get-delegation owner tx-sender) ERR_DELEGATION_NOT_FOUND))
+  )
+    ;; Validate delegation permissions
+    (asserts! (get active delegation-info) ERR_DELEGATION_NOT_FOUND)
+    (asserts! (>= (get expires-at delegation-info) stacks-block-height) ERR_DELEGATION_EXPIRED)
+    (asserts! (<= (+ (get used-amount delegation-info) (get amount proposal)) (get max-amount delegation-info)) ERR_DELEGATION_LIMIT_EXCEEDED)
+    
+    ;; Validate proposal state
+    (asserts! (not (has-signed proposal-id owner)) ERR_ALREADY_SIGNED)
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_ALREADY_EXECUTED)
+    (asserts! (>= (get expiration proposal) stacks-block-height) ERR_PROPOSAL_EXPIRED)
+    
+    ;; Record signature under the owner's name
+    (map-set signatures
+      { proposal-id: proposal-id, signer: owner }
+      { signed: true }
+    )
+    
+    ;; Update signature count
+    (map-set proposal-signature-count
+      { proposal-id: proposal-id }
+      { count: (+ (get count signature-count) u1) }
+    )
+    
+    ;; Update delegation usage
+    (map-set delegations
+      { owner: owner, delegate: tx-sender }
+      (merge delegation-info { used-amount: (+ (get used-amount delegation-info) (get amount proposal)) })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Helper function to update delegation usage after successful delegation signing
+(define-private (update-delegation-usage (owner principal) (delegate principal) (amount uint))
+  (let (
+    (delegation-info (unwrap-panic (get-delegation owner delegate)))
+  )
+    (map-set delegations
+      { owner: owner, delegate: delegate }
+      (merge delegation-info { used-amount: (+ (get used-amount delegation-info) amount) })
+    )
   )
 )
 
